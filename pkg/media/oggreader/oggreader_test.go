@@ -905,3 +905,401 @@ func makeOpusHeadWithChannelMapping(channels uint8, mappingFamily uint8) []byte 
 
 	return pack
 }
+
+// buildRawPage builds an Ogg page with an explicit lacing (segment) table.
+// The checksum field is zeroed: either use WithDoChecksum(false) or call
+// fixPageChecksum on the returned page.
+func buildRawPage(serial, index uint32, headerType uint8, granule uint64, segments, payload []byte) []byte {
+	page := make([]byte, 0, pageHeaderLen+len(segments)+len(payload))
+	page = append(page, []byte(pageHeaderSignature)...)
+	page = append(page, 0) // version
+	page = append(page, headerType)
+
+	var buf [8]byte
+	binary.LittleEndian.PutUint64(buf[:], granule)
+	page = append(page, buf[:]...)
+	binary.LittleEndian.PutUint32(buf[:4], serial)
+	page = append(page, buf[:4]...)
+	binary.LittleEndian.PutUint32(buf[:4], index)
+	page = append(page, buf[:4]...)
+	page = append(page, 0, 0, 0, 0)          // checksum
+	page = append(page, byte(len(segments))) //nolint:gosec // G115: test-only, sized by construction.
+	page = append(page, segments...)
+	page = append(page, payload...)
+
+	return page
+}
+
+// fixPageChecksum computes the Ogg CRC of a page and writes it into the
+// page's checksum field.
+func fixPageChecksum(page []byte) {
+	table := generateChecksumTable()
+	for i := 22; i < 26; i++ {
+		page[i] = 0
+	}
+
+	var checksum uint32
+	for _, b := range page {
+		checksum = (checksum << 8) ^ table[byte(checksum>>24)^b]
+	}
+	binary.LittleEndian.PutUint32(page[22:26], checksum)
+}
+
+func newPacketReader(t *testing.T, container []byte, options ...Option) *OggReader {
+	t.Helper()
+
+	reader, err := NewWithOptions(bytes.NewReader(container), options...)
+	assert.NoError(t, err)
+	assert.NotNil(t, reader)
+
+	return reader
+}
+
+func TestOggReader_ParseNextPacket_TwoPacketsOnePage(t *testing.T) {
+	const serial = uint32(0xdeadbeef)
+
+	page := buildRawPage(serial, 0, 0, 42, []byte{3, 2}, []byte{0x01, 0x02, 0x03, 0x04, 0x05})
+	reader := newPacketReader(t, page, WithDoChecksum(false))
+
+	pkt, hdr, err := reader.ParseNextPacket()
+	assert.NoError(t, err)
+	assert.Equal(t, []byte{0x01, 0x02, 0x03}, pkt)
+	assert.Equal(t, serial, hdr.Serial)
+	assert.Equal(t, uint64(42), hdr.GranulePosition)
+	assert.Equal(t, headerUnknown, hdr.HeaderType)
+
+	pkt, hdr, err = reader.ParseNextPacket()
+	assert.NoError(t, err)
+	assert.Equal(t, []byte{0x04, 0x05}, pkt)
+	assert.Equal(t, serial, hdr.Serial)
+	assert.Equal(t, uint64(42), hdr.GranulePosition)
+
+	_, _, err = reader.ParseNextPacket()
+	assert.ErrorIs(t, err, io.EOF)
+}
+
+func TestOggReader_ParseNextPacket_SpansThreePages(t *testing.T) {
+	const serial = uint32(7)
+
+	data := make([]byte, 520) // 255 + 255 + 10
+	for i := range data {
+		data[i] = byte(i % 251)
+	}
+
+	container := buildRawPage(serial, 0, 0, 0, []byte{255}, data[:255])
+	container = append(container, buildRawPage(serial, 1, pageHeaderTypeContinuation, 0, []byte{255}, data[255:510])...)
+	container = append(container, buildRawPage(serial, 2, pageHeaderTypeContinuation, 960, []byte{10}, data[510:])...)
+
+	reader := newPacketReader(t, container, WithDoChecksum(false))
+
+	pkt, hdr, err := reader.ParseNextPacket()
+	assert.NoError(t, err)
+	assert.Equal(t, data, pkt)
+	assert.Equal(t, serial, hdr.Serial)
+	assert.Equal(t, uint64(960), hdr.GranulePosition)
+
+	_, _, err = reader.ParseNextPacket()
+	assert.ErrorIs(t, err, io.EOF)
+}
+
+func TestOggReader_ParseNextPacket_MultiSerial(t *testing.T) {
+	const (
+		serialA = uint32(111)
+		serialB = uint32(222)
+	)
+
+	container := buildRawPage(serialA, 0, 0, 10, []byte{2}, []byte{0xa1, 0xa2})
+	container = append(container, buildRawPage(serialB, 0, 0, 20, []byte{3}, []byte{0xb1, 0xb2, 0xb3})...)
+	container = append(container, buildRawPage(serialA, 1, 0, 30, []byte{1}, []byte{0xa3})...)
+
+	reader := newPacketReader(t, container, WithDoChecksum(false))
+
+	type expectation struct {
+		serial  uint32
+		granule uint64
+		data    []byte
+	}
+	expected := []expectation{
+		{serialA, 10, []byte{0xa1, 0xa2}},
+		{serialB, 20, []byte{0xb1, 0xb2, 0xb3}},
+		{serialA, 30, []byte{0xa3}},
+	}
+
+	for i, exp := range expected {
+		pkt, hdr, err := reader.ParseNextPacket()
+		assert.NoError(t, err, "packet %d", i)
+		assert.Equal(t, exp.data, pkt, "packet %d", i)
+		assert.Equal(t, exp.serial, hdr.Serial, "packet %d", i)
+		assert.Equal(t, exp.granule, hdr.GranulePosition, "packet %d", i)
+	}
+
+	_, _, err := reader.ParseNextPacket()
+	assert.ErrorIs(t, err, io.EOF)
+}
+
+func TestOggReader_ParseNextPacket_MultiSerialInterleavedContinuation(t *testing.T) {
+	const (
+		serialA = uint32(111)
+		serialB = uint32(222)
+	)
+
+	dataA := []byte{0xa1, 0xa2, 0xa3}
+	dataB := []byte{0xb1, 0xb2, 0xb3}
+
+	// Both streams leave a packet unfinished on their first page; the
+	// continuations arrive interleaved.
+	container := buildRawPage(serialA, 0, 0, 0, []byte{255}, append(make([]byte, 253), 0xa1, 0xa2))
+	container = append(container, buildRawPage(serialB, 0, 0, 0, []byte{255}, append(make([]byte, 253), 0xb1, 0xb2))...)
+	container = append(container, buildRawPage(serialA, 1, pageHeaderTypeContinuation, 10, []byte{1}, []byte{0xa3})...)
+	container = append(container, buildRawPage(serialB, 1, pageHeaderTypeContinuation, 20, []byte{1}, []byte{0xb3})...)
+
+	reader := newPacketReader(t, container, WithDoChecksum(false))
+
+	pkt, hdr, err := reader.ParseNextPacket()
+	assert.NoError(t, err)
+	assert.Equal(t, append(make([]byte, 253), dataA...), pkt)
+	assert.Equal(t, serialA, hdr.Serial)
+	assert.Equal(t, uint64(10), hdr.GranulePosition)
+
+	pkt, hdr, err = reader.ParseNextPacket()
+	assert.NoError(t, err)
+	assert.Equal(t, append(make([]byte, 253), dataB...), pkt)
+	assert.Equal(t, serialB, hdr.Serial)
+	assert.Equal(t, uint64(20), hdr.GranulePosition)
+
+	_, _, err = reader.ParseNextPacket()
+	assert.ErrorIs(t, err, io.EOF)
+}
+
+func TestOggReader_ParseNextPacket_Errors(t *testing.T) {
+	const serial = uint32(0xabcd)
+
+	t.Run("PageSequenceGap", func(t *testing.T) {
+		container := buildRawPage(serial, 0, 0, 1, []byte{1}, []byte{0xaa})
+		container = append(container, buildRawPage(serial, 2, 0, 2, []byte{1}, []byte{0xbb})...)
+
+		reader := newPacketReader(t, container, WithDoChecksum(false))
+
+		pkt, _, err := reader.ParseNextPacket()
+		assert.NoError(t, err)
+		assert.Equal(t, []byte{0xaa}, pkt)
+
+		_, _, err = reader.ParseNextPacket()
+		assert.ErrorIs(t, err, errPageSequenceGap)
+
+		// The packet on the page after the gap is still delivered.
+		pkt, _, err = reader.ParseNextPacket()
+		assert.NoError(t, err)
+		assert.Equal(t, []byte{0xbb}, pkt)
+
+		_, _, err = reader.ParseNextPacket()
+		assert.ErrorIs(t, err, io.EOF)
+	})
+
+	t.Run("PageSequenceGapDropsPendingPacket", func(t *testing.T) {
+		container := buildRawPage(serial, 0, 0, 0, []byte{255}, make([]byte, 255))
+		container = append(container, buildRawPage(serial, 2, 0, 2, []byte{1}, []byte{0xcc})...)
+
+		reader := newPacketReader(t, container, WithDoChecksum(false))
+
+		_, _, err := reader.ParseNextPacket()
+		assert.ErrorIs(t, err, errPageSequenceGap)
+
+		pkt, _, err := reader.ParseNextPacket()
+		assert.NoError(t, err)
+		assert.Equal(t, []byte{0xcc}, pkt)
+
+		_, _, err = reader.ParseNextPacket()
+		assert.ErrorIs(t, err, io.EOF)
+	})
+
+	t.Run("MissingContinuationDropsPendingPacket", func(t *testing.T) {
+		// Consecutive page indices, but the second page is not marked as a
+		// continuation: the pending packet can never complete.
+		container := buildRawPage(serial, 0, 0, 0, []byte{255}, make([]byte, 255))
+		container = append(container, buildRawPage(serial, 1, 0, 2, []byte{1}, []byte{0xdd})...)
+
+		reader := newPacketReader(t, container, WithDoChecksum(false))
+
+		_, _, err := reader.ParseNextPacket()
+		assert.ErrorIs(t, err, errPageSequenceGap)
+
+		pkt, _, err := reader.ParseNextPacket()
+		assert.NoError(t, err)
+		assert.Equal(t, []byte{0xdd}, pkt)
+	})
+
+	t.Run("DuplicatePage", func(t *testing.T) {
+		page0 := buildRawPage(serial, 0, 0, 1, []byte{1}, []byte{0xaa})
+		container := append(append([]byte{}, page0...), page0...)
+		container = append(container, buildRawPage(serial, 1, 0, 2, []byte{1}, []byte{0xbb})...)
+
+		reader := newPacketReader(t, container, WithDoChecksum(false))
+
+		pkt, _, err := reader.ParseNextPacket()
+		assert.NoError(t, err)
+		assert.Equal(t, []byte{0xaa}, pkt)
+
+		_, _, err = reader.ParseNextPacket()
+		assert.ErrorIs(t, err, errDuplicatePage)
+
+		pkt, _, err = reader.ParseNextPacket()
+		assert.NoError(t, err)
+		assert.Equal(t, []byte{0xbb}, pkt)
+
+		_, _, err = reader.ParseNextPacket()
+		assert.ErrorIs(t, err, io.EOF)
+	})
+
+	t.Run("UnfinishedPacketAtEOF", func(t *testing.T) {
+		container := buildRawPage(serial, 0, 0, 0, []byte{255}, make([]byte, 255))
+
+		reader := newPacketReader(t, container, WithDoChecksum(false))
+
+		_, _, err := reader.ParseNextPacket()
+		assert.ErrorIs(t, err, io.ErrUnexpectedEOF)
+
+		_, _, err = reader.ParseNextPacket()
+		assert.ErrorIs(t, err, io.EOF)
+	})
+
+	t.Run("ZeroLengthPacket", func(t *testing.T) {
+		container := buildRawPage(serial, 0, 0, 5, []byte{0, 1}, []byte{0xaa})
+
+		reader := newPacketReader(t, container, WithDoChecksum(false))
+
+		pkt, hdr, err := reader.ParseNextPacket()
+		assert.NoError(t, err)
+		assert.NotNil(t, pkt)
+		assert.Empty(t, pkt)
+		assert.Equal(t, uint64(5), hdr.GranulePosition)
+
+		pkt, _, err = reader.ParseNextPacket()
+		assert.NoError(t, err)
+		assert.Equal(t, []byte{0xaa}, pkt)
+
+		_, _, err = reader.ParseNextPacket()
+		assert.ErrorIs(t, err, io.EOF)
+	})
+
+	t.Run("ChecksumMismatch", func(t *testing.T) {
+		page0 := buildRawPage(serial, 0, 0, 1, []byte{1}, []byte{0xaa})
+		fixPageChecksum(page0)
+		page1 := buildRawPage(serial, 1, 0, 2, []byte{1}, []byte{0xbb})
+		fixPageChecksum(page1)
+		page1[len(page1)-1] ^= 0xff // corrupt the payload
+
+		reader := newPacketReader(t, append(page0, page1...))
+
+		pkt, _, err := reader.ParseNextPacket()
+		assert.NoError(t, err)
+		assert.Equal(t, []byte{0xaa}, pkt)
+
+		_, _, err = reader.ParseNextPacket()
+		assert.ErrorIs(t, err, errChecksumMismatch)
+
+		_, _, err = reader.ParseNextPacket()
+		assert.ErrorIs(t, err, io.EOF)
+	})
+
+	t.Run("PacketTooLarge", func(t *testing.T) {
+		container := buildRawPage(serial, 0, 0, 1, []byte{5, 12}, []byte{
+			0x01, 0x02, 0x03, 0x04, 0x05,
+			0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f, 0x10, 0x11,
+		})
+
+		reader := newPacketReader(t, container, WithDoChecksum(false), WithMaxPacketSize(10))
+
+		_, _, err := reader.ParseNextPacket()
+		assert.ErrorIs(t, err, errPacketTooLarge)
+
+		// The well-formed packet on the same page is still delivered.
+		pkt, _, err := reader.ParseNextPacket()
+		assert.NoError(t, err)
+		assert.Equal(t, []byte{0x01, 0x02, 0x03, 0x04, 0x05}, pkt)
+
+		_, _, err = reader.ParseNextPacket()
+		assert.ErrorIs(t, err, io.EOF)
+	})
+
+	t.Run("PacketTooLargeAcrossPages", func(t *testing.T) {
+		container := buildRawPage(serial, 0, 0, 0, []byte{255}, make([]byte, 255))
+		container = append(container, buildRawPage(serial, 1, pageHeaderTypeContinuation, 1, []byte{3}, []byte{0x01, 0x02, 0x03})...)
+		container = append(container, buildRawPage(serial, 2, 0, 2, []byte{1}, []byte{0xee})...)
+
+		reader := newPacketReader(t, container, WithDoChecksum(false), WithMaxPacketSize(100))
+
+		_, _, err := reader.ParseNextPacket()
+		assert.ErrorIs(t, err, errPacketTooLarge)
+
+		// The remainder of the oversized packet is discarded as an orphaned
+		// continuation; the next fresh packet is delivered.
+		pkt, _, err := reader.ParseNextPacket()
+		assert.NoError(t, err)
+		assert.Equal(t, []byte{0xee}, pkt)
+
+		_, _, err = reader.ParseNextPacket()
+		assert.ErrorIs(t, err, io.EOF)
+	})
+
+	t.Run("InvalidMaxPacketSize", func(t *testing.T) {
+		_, err := NewWithOptions(bytes.NewReader(nil), WithMaxPacketSize(0))
+		assert.ErrorIs(t, err, errInvalidMaxPacketSize)
+	})
+}
+
+func TestOggReader_ParseNextPacket_IncludesOpusHead(t *testing.T) {
+	reader, header, err := NewWith(bytes.NewReader(buildOggContainer()))
+	assert.NoError(t, err)
+	assert.NotNil(t, header)
+
+	// The OpusHead packet consumed by NewWith is still observable.
+	pkt, hdr, err := reader.ParseNextPacket()
+	assert.NoError(t, err)
+	assert.Equal(t, HeaderOpusID, hdr.HeaderType)
+	assert.Equal(t, uint32(0xaa209b8e), hdr.Serial)
+	parsed, err := ParseOpusHead(pkt)
+	assert.NoError(t, err)
+	assert.Equal(t, header, parsed)
+
+	// The fixture's second page has sequence number 2 (page 1 is missing):
+	// the gap is reported but is not fatal...
+	_, _, err = reader.ParseNextPacket()
+	assert.ErrorIs(t, err, errPageSequenceGap)
+
+	// ...and the audio packet on that page is still delivered.
+	pkt, hdr, err = reader.ParseNextPacket()
+	assert.NoError(t, err)
+	assert.Equal(t, []byte{0x98, 0x36, 0xbe, 0x88, 0x9e}, pkt)
+	assert.Equal(t, headerUnknown, hdr.HeaderType)
+
+	_, _, err = reader.ParseNextPacket()
+	assert.ErrorIs(t, err, io.EOF)
+}
+
+func TestOggReader_ParseNextPacket_OpusTagsMarker(t *testing.T) {
+	const serial = uint32(0xfa6e13f0)
+
+	headPayload := buildOpusHeadPayload(1, 2, 0x0138, 48000, 0, 0)
+	tagsPayload := buildOpusTagsPayload("TestVendor", []UserComment{{Comment: "title", Value: "hello"}})
+
+	container := buildOggPage(serial, 0, pageHeaderTypeBeginningOfStream, headPayload)
+	container = append(container, buildOggPage(serial, 1, 0, tagsPayload)...)
+
+	reader := newPacketReader(t, container, WithDoChecksum(false))
+
+	pkt, hdr, err := reader.ParseNextPacket()
+	assert.NoError(t, err)
+	assert.Equal(t, HeaderOpusID, hdr.HeaderType)
+	assert.Equal(t, headPayload, pkt)
+
+	pkt, hdr, err = reader.ParseNextPacket()
+	assert.NoError(t, err)
+	assert.Equal(t, HeaderOpusTags, hdr.HeaderType)
+	tags, err := ParseOpusTags(pkt)
+	assert.NoError(t, err)
+	assert.Equal(t, "TestVendor", tags.Vendor)
+
+	_, _, err = reader.ParseNextPacket()
+	assert.ErrorIs(t, err, io.EOF)
+}

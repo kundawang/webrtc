@@ -13,11 +13,17 @@ import (
 )
 
 const (
+	pageHeaderTypeContinuation      = 0x01
 	pageHeaderTypeBeginningOfStream = 0x02
 	pageHeaderSignature             = "OggS"
 
 	idPageBasePayloadLength = 19
 	pageHeaderLen           = 27
+
+	// defaultMaxPacketSize bounds the size of a single logical packet
+	// assembled by ParseNextPacket. Packets growing beyond this limit are
+	// discarded and reported with errPacketTooLarge.
+	defaultMaxPacketSize = 1 << 20 // 1 MiB
 )
 
 var (
@@ -30,6 +36,10 @@ var (
 	errShortPageHeader                 = errors.New("not enough data for payload header")
 	errChecksumMismatch                = errors.New("expected and actual checksum do not match")
 	errUnsupportedChannelMappingFamily = errors.New("unsupported channel mapping family")
+	errPacketTooLarge                  = errors.New("packet exceeds maximum packet size")
+	errPageSequenceGap                 = errors.New("page sequence gap detected, packets may have been lost")
+	errDuplicatePage                   = errors.New("duplicate page detected, page ignored")
+	errInvalidMaxPacketSize            = errors.New("max packet size must be greater than zero")
 )
 
 // OggReader is used to read Ogg files and return page payloads.
@@ -38,6 +48,9 @@ type OggReader struct {
 	bytesReadSuccesfully int64
 	checksumTable        *[256]uint32
 	doChecksum           bool
+	streams              map[uint32]*packetAssembler
+	packetQueue          []oggPacket
+	maxPacketSize        int
 }
 
 // OggHeader contains Opus codec metadata parsed from an Opus ID page.
@@ -123,6 +136,41 @@ func (p *OggPageHeader) HeaderType(payload []byte) (HeaderType, bool) {
 	return sig, true
 }
 
+// OggPacketHeader is the metadata for a single logical packet returned by
+// ParseNextPacket. A packet is the unit a codec consumes: one or more packets
+// may share a page, and one packet may span several (continuation) pages.
+type OggPacketHeader struct {
+	// Serial identifies the logical bitstream the packet belongs to.
+	Serial uint32
+	// GranulePosition is the granule position of the page on which the
+	// packet completed.
+	GranulePosition uint64
+	// HeaderType classifies the packet payload: HeaderOpusID for an OpusHead
+	// packet, HeaderOpusTags for an OpusTags packet, empty otherwise.
+	HeaderType HeaderType
+}
+
+// oggPacket is a fully assembled logical packet waiting to be consumed.
+type oggPacket struct {
+	header OggPacketHeader
+	data   []byte
+}
+
+// oggPage is a raw page as read from the stream: parsed header, the lacing
+// (segment) table and the page payload.
+type oggPage struct {
+	header   *OggPageHeader
+	segments []byte
+	payload  []byte
+}
+
+// packetAssembler holds the reassembly state of one logical bitstream.
+type packetAssembler struct {
+	partial   []byte
+	lastIndex uint32
+	started   bool
+}
+
 type Option func(*OggReader) error
 
 // NewWith returns a new Ogg reader and Ogg header
@@ -142,6 +190,8 @@ func NewWithOptions(in io.Reader, options ...Option) (*OggReader, error) {
 		stream:        in,
 		checksumTable: generateChecksumTable(),
 		doChecksum:    true,
+		streams:       make(map[uint32]*packetAssembler),
+		maxPacketSize: defaultMaxPacketSize,
 	}
 
 	for _, option := range options {
@@ -163,15 +213,28 @@ func WithDoChecksum(doChecksum bool) Option {
 	}
 }
 
+// WithMaxPacketSize sets the maximum size in bytes of a single logical packet
+// assembled by ParseNextPacket. Packets growing beyond this limit are
+// discarded and reported with errPacketTooLarge. Default is 1 MiB.
+func WithMaxPacketSize(maxPacketSize int) Option {
+	return func(o *OggReader) error {
+		if maxPacketSize <= 0 {
+			return errInvalidMaxPacketSize
+		}
+		o.maxPacketSize = maxPacketSize
+
+		return nil
+	}
+}
+
 func newWith(in io.Reader, doChecksum bool) (*OggReader, *OggHeader, error) {
 	if in == nil {
 		return nil, nil, errNilStream
 	}
 
-	reader := &OggReader{
-		stream:        in,
-		checksumTable: generateChecksumTable(),
-		doChecksum:    doChecksum,
+	reader, err := NewWithOptions(in, WithDoChecksum(doChecksum))
+	if err != nil {
+		return nil, nil, err
 	}
 
 	header, err := reader.readOpusHeader()
@@ -183,19 +246,23 @@ func newWith(in io.Reader, doChecksum bool) (*OggReader, *OggHeader, error) {
 }
 
 func (o *OggReader) readOpusHeader() (*OggHeader, error) {
-	payload, pageHeader, err := o.ParseNextPage()
+	page, err := o.readPage()
 	if err != nil {
 		return nil, err
 	}
 
-	if err := validateOpusPageHeader(pageHeader, payload); err != nil {
+	if err := validateOpusPageHeader(page.header, page.payload); err != nil {
 		return nil, err
 	}
 
-	header := parseBasicHeaderFields(payload)
-	if err := parseChannelMapping(header, payload); err != nil {
+	header := parseBasicHeaderFields(page.payload)
+	if err := parseChannelMapping(header, page.payload); err != nil {
 		return nil, err
 	}
+
+	// Queue the ID page as a packet so that ParseNextPacket observes the
+	// complete logical stream, including the OpusHead packet.
+	_ = o.processPage(page)
 
 	return header, nil
 }
@@ -271,14 +338,25 @@ func parseExtendedChannelMapping(header *OggHeader, payload []byte) error {
 
 // ParseNextPage reads from stream and returns Ogg page payload, header,
 // and an error if there is incomplete page data.
-func (o *OggReader) ParseNextPage() ([]byte, *OggPageHeader, error) { //nolint:cyclop
+func (o *OggReader) ParseNextPage() ([]byte, *OggPageHeader, error) {
+	page, err := o.readPage()
+	if err != nil {
+		return nil, nil, err
+	}
+
+	return page.payload, page.header, nil
+}
+
+// readPage reads a single raw page (header, lacing table and payload) from
+// the stream.
+func (o *OggReader) readPage() (*oggPage, error) {
 	header := make([]byte, pageHeaderLen)
 
 	n, err := io.ReadFull(o.stream, header)
 	if err != nil {
-		return nil, nil, err
+		return nil, err
 	} else if n < len(header) {
-		return nil, nil, errShortPageHeader
+		return nil, errShortPageHeader
 	}
 
 	pageHeader := &OggPageHeader{
@@ -294,7 +372,7 @@ func (o *OggReader) ParseNextPage() ([]byte, *OggPageHeader, error) { //nolint:c
 
 	sizeBuffer := make([]byte, pageHeader.segmentsCount)
 	if _, err = io.ReadFull(o.stream, sizeBuffer); err != nil {
-		return nil, nil, err
+		return nil, err
 	}
 
 	payloadSize := 0
@@ -304,7 +382,7 @@ func (o *OggReader) ParseNextPage() ([]byte, *OggPageHeader, error) { //nolint:c
 
 	payload := make([]byte, payloadSize)
 	if _, err = io.ReadFull(o.stream, payload); err != nil {
-		return nil, nil, err
+		return nil, err
 	}
 
 	if o.doChecksum {
@@ -331,13 +409,223 @@ func (o *OggReader) ParseNextPage() ([]byte, *OggPageHeader, error) { //nolint:c
 		}
 
 		if binary.LittleEndian.Uint32(header[22:22+4]) != checksum {
-			return nil, nil, errChecksumMismatch
+			return nil, errChecksumMismatch
 		}
 	}
 
 	o.bytesReadSuccesfully += int64(len(header) + len(sizeBuffer) + len(payload))
 
-	return payload, pageHeader, nil
+	return &oggPage{header: pageHeader, segments: sizeBuffer, payload: payload}, nil
+}
+
+// ParseNextPacket reads from the stream and returns the next complete logical
+// packet. Packets are extracted from the lacing (segment) table of each page
+// and reassembled across continuation pages; page headers are never included
+// in the returned data. Pages of all logical bitstreams are demultiplexed:
+// every returned packet is tagged with the serial of the stream it belongs to
+// and the granule position of the page on which it completed.
+//
+// Do not interleave ParseNextPacket with ParseNextPage: pages consumed by one
+// are invisible to the other.
+//
+// The returned error is io.EOF once the stream is fully consumed, or
+// io.ErrUnexpectedEOF if the stream ends while a packet is still incomplete.
+// A page that fails checksum validation yields errChecksumMismatch and any
+// incomplete packets are dropped. Lost pages (errPageSequenceGap), duplicate
+// pages (errDuplicatePage) and oversized packets (errPacketTooLarge, see
+// WithMaxPacketSize) are non-fatal: packets that were completed on the same
+// page remain queued and are returned by subsequent calls.
+func (o *OggReader) ParseNextPacket() ([]byte, *OggPacketHeader, error) {
+	for {
+		if len(o.packetQueue) > 0 {
+			pkt := o.packetQueue[0]
+			o.packetQueue = o.packetQueue[1:]
+			header := pkt.header
+
+			return pkt.data, &header, nil
+		}
+
+		page, err := o.readPage()
+		if err != nil {
+			if errors.Is(err, io.EOF) {
+				if o.hasPendingPacket() {
+					// The stream ended before the pending packet completed.
+					o.dropPendingPackets()
+
+					return nil, nil, io.ErrUnexpectedEOF
+				}
+
+				return nil, nil, err
+			}
+
+			// The page could not be read or validated (e.g. checksum
+			// mismatch); pending packets can no longer be completed.
+			o.dropPendingPackets()
+
+			return nil, nil, err
+		}
+
+		if err = o.processPage(page); err != nil {
+			// Non-fatal: packets completed on this page stay queued and are
+			// returned by subsequent calls.
+			return nil, nil, err
+		}
+	}
+}
+
+// processPage folds one raw page into the reassembly state of its logical
+// stream and queues every packet the page completes.
+func (o *OggReader) processPage(page *oggPage) error {
+	st := o.streams[page.header.Serial]
+	if st == nil {
+		st = &packetAssembler{}
+		o.streams[page.header.Serial] = st
+	}
+
+	retErr := checkPageSequence(st, page.header)
+	if errors.Is(retErr, errDuplicatePage) {
+		return retErr
+	}
+
+	segOff := 0
+	continued := page.header.headerType&pageHeaderTypeContinuation != 0
+	switch {
+	case continued && len(st.partial) == 0:
+		// The start of the continued packet is missing (the stream was
+		// joined mid-packet, or the preceding page was lost or oversized):
+		// discard the orphaned leading fragment.
+		segOff = skipLeadingFragment(page.segments)
+	case !continued && len(st.partial) > 0:
+		// The page that should have completed the pending packet never
+		// arrived.
+		st.partial = nil
+		if retErr == nil {
+			retErr = errPageSequenceGap
+		}
+	}
+
+	if err := o.assembleSegments(st, page, segOff); err != nil && retErr == nil {
+		retErr = err
+	}
+
+	return retErr
+}
+
+// checkPageSequence validates the page sequence number of one logical stream
+// and drops state that can no longer produce a complete packet.
+func checkPageSequence(st *packetAssembler, header *OggPageHeader) error {
+	if st.started {
+		switch {
+		case header.index == st.lastIndex:
+			return errDuplicatePage
+		case header.index != st.lastIndex+1:
+			// One or more pages were lost: a pending packet can no longer be
+			// completed.
+			st.partial = nil
+			st.lastIndex = header.index
+
+			return errPageSequenceGap
+		}
+	}
+
+	st.started = true
+	st.lastIndex = header.index
+
+	return nil
+}
+
+// skipLeadingFragment returns the number of lacing values that make up the
+// first (orphaned) packet fragment of a page.
+func skipLeadingFragment(segments []byte) int {
+	i := 0
+	for i < len(segments) {
+		v := segments[i]
+		i++
+		if v < 255 {
+			break
+		}
+	}
+
+	return i
+}
+
+// assembleSegments walks the lacing table of a page (skipping segOff orphaned
+// leading segments), appends every fragment to the pending packet and queues
+// each packet that terminates on this page.
+func (o *OggReader) assembleSegments(st *packetAssembler, page *oggPage, segOff int) error {
+	payload := page.payload
+	for _, s := range page.segments[:segOff] {
+		payload = payload[int(s):]
+	}
+
+	var retErr error
+	segments := page.segments[segOff:]
+	for i := 0; i < len(segments); i++ {
+		v := int(segments[i])
+		st.partial = append(st.partial, payload[:v]...)
+		payload = payload[v:]
+
+		if len(st.partial) > o.maxPacketSize {
+			// Drop the oversized packet, including every following segment
+			// up to and including the one that terminates it. If it does not
+			// terminate on this page, the next page's continuation is
+			// discarded as an orphaned fragment.
+			st.partial = st.partial[:0]
+			retErr = errPacketTooLarge
+			for v == 255 && i+1 < len(segments) {
+				i++
+				v = int(segments[i])
+				payload = payload[v:]
+			}
+
+			continue
+		}
+
+		if v < 255 {
+			// A lacing value below 255 terminates the packet; a zero lacing
+			// value yields a valid zero-length packet.
+			o.queuePacket(page.header, st.partial)
+			st.partial = st.partial[:0]
+		}
+	}
+
+	return retErr
+}
+
+// queuePacket copies the assembled bytes and appends the packet to the queue.
+func (o *OggReader) queuePacket(pageHeader *OggPageHeader, data []byte) {
+	pkt := make([]byte, len(data))
+	copy(pkt, data)
+
+	sig, _ := opusPayloadSignature(pkt)
+
+	o.packetQueue = append(o.packetQueue, oggPacket{
+		data: pkt,
+		header: OggPacketHeader{
+			Serial:          pageHeader.Serial,
+			GranulePosition: pageHeader.GranulePosition,
+			HeaderType:      sig,
+		},
+	})
+}
+
+// hasPendingPacket reports whether any logical stream holds an incomplete
+// packet.
+func (o *OggReader) hasPendingPacket() bool {
+	for _, st := range o.streams {
+		if len(st.partial) > 0 {
+			return true
+		}
+	}
+
+	return false
+}
+
+// dropPendingPackets discards every incomplete packet.
+func (o *OggReader) dropPendingPackets() {
+	for _, st := range o.streams {
+		st.partial = nil
+	}
 }
 
 // ResetReader resets the internal stream of OggReader. This is useful
