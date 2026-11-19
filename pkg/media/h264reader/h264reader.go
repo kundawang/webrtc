@@ -19,6 +19,14 @@ type H264Reader struct {
 	readBuffer                  []byte
 	tmpReadBuf                  []byte
 	includeSEI                  bool
+
+	// Access unit grouping state, used by NextAccessUnit.
+	pendingAU           *AccessUnit
+	readyAU             *AccessUnit
+	activeSPS           *NAL
+	activePPS           *NAL
+	maxAccessUnitSize   int
+	parameterSetChanged bool
 }
 
 var (
